@@ -1,5 +1,4 @@
 import sys
-import sys
 import threading
 import tkinter as tk
 from tkinter import scrolledtext, messagebox, filedialog
@@ -16,13 +15,19 @@ class BarbaricUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Barbaric Voice Agent")
-        self.geometry("720x720")
+        self.geometry("900x740")
         self.configure(bg="#23272e")
 
         # State
         self.listen_thread = None
         self.listen_stop = threading.Event()
         self.always_listen_var = tk.BooleanVar(value=barbaric.SETTINGS.get("always_listen", False))
+        self._agent_state = 'idle'  # idle|listening|thinking|speaking|acting|ocr_scan|success|warning|error
+        self._accent = "#00e0ff"
+        self._accent_target = self._accent
+        self._hud_angle = 0.0
+        self._hud_pulse = 0.0
+        self._hud_running = True
 
         # Build UI
         self.create_widgets()
@@ -66,11 +71,16 @@ class BarbaricUI(tk.Tk):
         if self.always_listen_var.get():
             self.start_always_listen()
 
+        # Start HUD + TTS watchers
+        self.after(0, self._hud_draw)
+        self.after(33, self._hud_step)
+        threading.Thread(target=self._tts_watcher, daemon=True).start()
+
     def create_widgets(self):
         self.header = tk.Label(self, text="Barbaric Voice Agent", font=("Segoe UI", 20, "bold"), fg="#00ff99", bg="#23272e")
         self.header.pack(pady=10)
 
-        # Visualizer
+        # Visualizer (top waveform)
         self.viz_canvas = tk.Canvas(self, height=100, bg="#0b0f16", highlightthickness=0)
         self.viz_canvas.pack(fill=tk.X, padx=12)
         self._viz_running = False
@@ -78,6 +88,10 @@ class BarbaricUI(tk.Tk):
         self._viz_color = "#00e0ff"
         self._viz_bg = "#0b0f16"
         self._viz_draw_bars()
+
+        # HUD canvas (dynamic ring/theme responder)
+        self.hud_canvas = tk.Canvas(self, height=180, bg="#10151c", highlightthickness=0)
+        self.hud_canvas.pack(fill=tk.X, padx=12, pady=6)
 
         # Toolbar
         self.toolbar = tk.Frame(self, bg="#23272e")
@@ -124,6 +138,129 @@ class BarbaricUI(tk.Tk):
         # Overlay placeholder
         self._grid_overlay = None
 
+    # ===== Agent state and dynamic theme =====
+    def set_agent_state(self, state: str, detail: str | None = None):
+        self._agent_state = state
+        label = {
+            'idle': ("Idle.", "#cccccc", "#00e0ff"),
+            'listening': ("Listening…", "#00e0ff", "#00b7ff"),
+            'thinking': ("Thinking…", "#ffaa33", "#ff7b00"),
+            'speaking': ("Speaking…", "#1bd1ff", "#00e0ff"),
+            'acting': ("Executing…", "#b388ff", "#7a5cff"),
+            'ocr_scan': ("Scanning screen…", "#ff66cc", "#ff33aa"),
+            'success': ("Done.", "#00e676", "#00c853"),
+            'warning': ("Warning", "#ffd54f", "#ffb300"),
+            'error': ("Error", "#ff5252", "#ff1744"),
+        }.get(state, (state.title(), "#cccccc", "#00e0ff"))
+        txt, fg, accent = label
+        if detail:
+            txt = f"{txt}  —  {detail}"
+        try:
+            self.status.config(text=txt, fg=fg)
+        except Exception:
+            pass
+        # animate accent transition
+        self._accent_target = accent
+
+    def _interp_color(self, c1: str, c2: str, t: float) -> str:
+        def hex_to_rgb(h):
+            h = h.lstrip('#')
+            return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+        def rgb_to_hex(r, g, b):
+            return f"#{r:02x}{g:02x}{b:02x}"
+        r1, g1, b1 = hex_to_rgb(c1)
+        r2, g2, b2 = hex_to_rgb(c2)
+        r = int(r1 + (r2 - r1) * t)
+        g = int(g1 + (g2 - g1) * t)
+        b = int(b1 + (b2 - b1) * t)
+        return rgb_to_hex(r, g, b)
+
+    def _hud_draw(self):
+        c = self.hud_canvas
+        if not c.winfo_ismapped():
+            return
+        c.delete("all")
+        w = c.winfo_width() or c.winfo_reqwidth()
+        h = c.winfo_height() or 180
+        cx, cy = w // 2, h // 2
+        # Smooth accent transition
+        try:
+            cur = self._accent
+            target = self._accent_target
+            if cur != target:
+                self._accent = self._interp_color(cur, target, 0.18)
+        except Exception:
+            pass
+        accent = self._accent
+
+        # Background grid
+        grid_color = "#1a232d"
+        step = 24
+        offset = int((time.time() * 20) % step)
+        for x in range(-offset, w, step):
+            c.create_line(x, 0, x, h, fill=grid_color)
+        for y in range(-offset, h, step):
+            c.create_line(0, y, w, y, fill=grid_color)
+
+        # Outer and inner arcs (rotating)
+        pulse = 1.0 + 0.06 * math.sin(self._hud_pulse)
+        r1 = int(72 * pulse)
+        r2 = int(110 * pulse)
+        for i, rad in enumerate((r1, r2)):
+            start = (self._hud_angle * (1.6 + 0.2 * i)) % 360
+            extent = 220 if i == 0 else 100
+            c.create_arc(cx - rad, cy - rad, cx + rad, cy + rad, start=start, extent=extent, outline=accent, style=tk.ARC, width=3)
+            c.create_arc(cx - rad, cy - rad, cx + rad, cy + rad, start=(start + 180) % 360, extent=extent - 40, outline="#66ffff", style=tk.ARC, width=1)
+
+        # Central ring with label
+        c.create_oval(cx - 56, cy - 56, cx + 56, cy + 56, outline=accent, width=2)
+        c.create_text(cx, cy, text=self._agent_state.upper(), fill="#bde9ff", font=("Segoe UI", 12, "bold"))
+
+        # Corner stats (time)
+        t = time.strftime("%H:%M:%S")
+        c.create_text(w - 10, 10, text=t, fill="#9fb3c8", font=("Consolas", 11), anchor='ne')
+
+    def _hud_step(self):
+        if not self._hud_running:
+            return
+        # Speed based on state
+        state = self._agent_state
+        if state == 'listening':
+            speed = 3.0; pulse = 0.45
+        elif state == 'thinking':
+            speed = 4.2; pulse = 0.6
+        elif state == 'speaking':
+            speed = 2.4; pulse = 0.35
+        elif state == 'acting' or state == 'ocr_scan':
+            speed = 5.0; pulse = 0.5
+        elif state == 'error':
+            speed = 7.0; pulse = 0.9
+        else:
+            speed = 1.6; pulse = 0.25
+        self._hud_angle = (self._hud_angle + speed) % 360
+        self._hud_pulse += pulse
+        try:
+            self._hud_draw()
+        finally:
+            self.after(33, self._hud_step)
+
+    def _tts_watcher(self):
+        # Observe the main module's TTS flag to reflect 'speaking' state visually
+        prev = False
+        while True:
+            try:
+                cur = bool(getattr(barbaric, 'TTS_IS_PLAYING', None) and barbaric.TTS_IS_PLAYING.is_set())
+            except Exception:
+                cur = False
+            if cur and not prev:
+                self.after(0, lambda: self.set_agent_state('speaking'))
+            elif (not cur) and prev:
+                # return to listening if active, else idle
+                next_state = 'listening' if self._viz_running else 'idle'
+                self.after(0, lambda s=next_state: self.set_agent_state(s))
+            prev = cur
+            time.sleep(0.08)
+
     # ===== Visualizer =====
     def _viz_draw_bars(self):
         c = self.viz_canvas
@@ -169,7 +306,7 @@ class BarbaricUI(tk.Tk):
         self.after(0, self._viz_draw_bars)
         self.after(33, self._viz_step)
         try:
-            self.status.config(text="Listening…", fg="#00e0ff")
+            self.set_agent_state('listening')
         except Exception:
             pass
 
@@ -178,7 +315,8 @@ class BarbaricUI(tk.Tk):
             return
         self._viz_running = False
         try:
-            self.status.config(text="Idle.", fg="#cccccc")
+            if not (getattr(barbaric, 'TTS_IS_PLAYING', None) and barbaric.TTS_IS_PLAYING.is_set()):
+                self.set_agent_state('idle')
         except Exception:
             pass
 
@@ -201,8 +339,21 @@ class BarbaricUI(tk.Tk):
             self.text_area.insert(tk.END, f"You: {user_input}\n")
             self.text_area.config(state=tk.DISABLED)
             self.input_entry.delete(0, tk.END)
-            response = barbaric.get_ai_response(user_input)
-            barbaric.handle_ai_response(response)
+            def _run(u=user_input):
+                try:
+                    self.set_agent_state('thinking')
+                    response = barbaric.get_ai_response(u)
+                    self.set_agent_state('acting')
+                    barbaric.handle_ai_response(response)
+                    # if TTS starts, watcher will override; otherwise success
+                    if not (getattr(barbaric, 'TTS_IS_PLAYING', None) and barbaric.TTS_IS_PLAYING.is_set()):
+                        self.set_agent_state('success')
+                except Exception as e:
+                    self.set_agent_state('error', str(e))
+                finally:
+                    if not (getattr(barbaric, 'TTS_IS_PLAYING', None) and barbaric.TTS_IS_PLAYING.is_set()):
+                        self.set_agent_state('idle')
+            threading.Thread(target=_run, daemon=True).start()
 
     def on_speak(self):
         self.start_visualizer()
@@ -212,12 +363,17 @@ class BarbaricUI(tk.Tk):
                 if not utterance:
                     return
                 self.after(0, lambda: self._append_user_voice(utterance))
+                self.set_agent_state('thinking')
                 response = barbaric.get_ai_response(utterance)
+                self.set_agent_state('acting')
                 barbaric.handle_ai_response(response)
             except Exception as e:
+                self.set_agent_state('error', str(e))
                 self.display_response(f"Voice input failed: {e}")
             finally:
                 self.stop_visualizer()
+                if not (getattr(barbaric, 'TTS_IS_PLAYING', None) and barbaric.TTS_IS_PLAYING.is_set()):
+                    self.set_agent_state('idle')
         threading.Thread(target=_listen_and_process, daemon=True).start()
 
     def _append_user_voice(self, utterance: str):
@@ -253,7 +409,9 @@ class BarbaricUI(tk.Tk):
                         utterance = barbaric.listen()
                         if utterance:
                             self.after(0, lambda u=utterance: self._append_user_voice(u))
+                            self.set_agent_state('thinking')
                             response = barbaric.get_ai_response(utterance)
+                            self.set_agent_state('acting')
                             barbaric.handle_ai_response(response)
                         else:
                             self.listen_stop.wait(0.2)
@@ -280,23 +438,34 @@ class BarbaricUI(tk.Tk):
                 if not ok:
                     self.display_response("OCR not available. Please configure Tesseract in Settings.")
                     return
+                self.set_agent_state('ocr_scan')
                 txt = barbaric.screen_ocr()
                 snippet = (txt[:800] + '…') if len(txt) > 800 else txt
                 self.display_response("Screen OCR:\n" + (snippet or "<no text found>"))
+                self.set_agent_state('success')
             except Exception as e:
+                self.set_agent_state('error', str(e))
                 self.display_response(f"Screen analysis failed: {e}")
+            finally:
+                self.set_agent_state('idle')
         threading.Thread(target=_run, daemon=True).start()
 
     def on_test_ocr(self):
         def _run():
             try:
+                self.set_agent_state('ocr_scan')
                 ok, msg = barbaric.test_ocr()
                 if ok:
                     self.display_response(f"OCR test passed: {msg}")
+                    self.set_agent_state('success')
                 else:
                     self.display_response(f"OCR test failed: {msg}")
+                    self.set_agent_state('warning')
             except Exception as e:
+                self.set_agent_state('error', str(e))
                 self.display_response(f"OCR test error: {e}")
+            finally:
+                self.set_agent_state('idle')
         threading.Thread(target=_run, daemon=True).start()
 
     # ===== Settings =====
@@ -417,7 +586,7 @@ class BarbaricUI(tk.Tk):
         widgets = [
             self.header, self.toolbar, self.status, self.input_frame, self.text_area,
             self.input_entry, self.send_btn, self.voice_btn, self.al_toggle,
-            self.settings_btn, self.viz_canvas, getattr(self, 'ocr_btn', None),
+            self.settings_btn, self.viz_canvas, self.hud_canvas, getattr(self, 'ocr_btn', None),
             getattr(self, 'test_ocr_btn', None)
         ]
         for w in widgets:

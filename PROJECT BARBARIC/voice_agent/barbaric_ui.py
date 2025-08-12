@@ -1,10 +1,8 @@
 import sys
-import os
+import sys
 import threading
 import tkinter as tk
-from tkinter import scrolledtext
-from tkinter import messagebox
-from tkinter import filedialog
+from tkinter import scrolledtext, messagebox, filedialog
 import speech_recognition as sr
 import math
 import random
@@ -18,66 +16,70 @@ class BarbaricUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Barbaric Voice Agent")
-        self.geometry("600x400")
+        self.geometry("720x720")
         self.configure(bg="#23272e")
 
-        # Background listening control and state
+        # State
         self.listen_thread = None
         self.listen_stop = threading.Event()
         self.always_listen_var = tk.BooleanVar(value=barbaric.SETTINGS.get("always_listen", False))
 
-        # Build UI first
+        # Build UI
         self.create_widgets()
-        
-        # Window close handling
+
+        # Close handling
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        # Wrap original speak to both TTS and UI log (after widgets exist)
+        # Hook TTS to UI log
         self._orig_speak = barbaric.speak
 
         def ui_speak(text: str):
-            # Normalize text for UI (avoid double prefix from agent)
             ui_text = text.replace('Barbaric says: ', '')
             self.display_response(ui_text)
             try:
                 self._orig_speak(text)
             except Exception:
                 pass
-
         barbaric.speak = ui_speak
-        
-        # Apply current theme
+
+        # Register UI so main can call overlay methods
+        try:
+            barbaric.register_ui(self)
+        except Exception:
+            pass
+
+        # Theme
         try:
             self.apply_theme(barbaric.SETTINGS.get("theme", "dark"))
         except Exception:
             pass
 
-        # Check OCR availability once and inform user if missing
+        # OCR availability info
         try:
             ok, err = barbaric.ocr_is_available()
             if not ok:
-                self.display_response("OCR not available. Install Tesseract OCR and set its path in Settings to enable on-screen text interactions.")
+                self.display_response("OCR not available. Install Tesseract OCR and set its path in Settings.")
         except Exception:
             pass
 
-        # Auto-start Always Listen if enabled
+        # Auto-start Always Listen
         if self.always_listen_var.get():
             self.start_always_listen()
 
     def create_widgets(self):
-        self.header = tk.Label(self, text="Barbaric Voice Agent", font=("Arial", 20, "bold"), fg="#00ff99", bg="#23272e")
+        self.header = tk.Label(self, text="Barbaric Voice Agent", font=("Segoe UI", 20, "bold"), fg="#00ff99", bg="#23272e")
         self.header.pack(pady=10)
 
-        # Visualizer (Jarvis-like audio bars)
-        self.viz_canvas = tk.Canvas(self, height=90, bg="#0b0f16", highlightthickness=0)
+        # Visualizer
+        self.viz_canvas = tk.Canvas(self, height=100, bg="#0b0f16", highlightthickness=0)
         self.viz_canvas.pack(fill=tk.X, padx=12)
         self._viz_running = False
-        self._viz_levels = [0.0] * 40  # 40 bars
+        self._viz_levels = [0.0] * 40
         self._viz_color = "#00e0ff"
         self._viz_bg = "#0b0f16"
-        self._viz_draw_bars()  # initial draw
+        self._viz_draw_bars()
 
-        # Toolbar with Always Listen toggle and Settings button
+        # Toolbar
         self.toolbar = tk.Frame(self, bg="#23272e")
         self.toolbar.pack(fill=tk.X, padx=10)
         self.al_toggle = tk.Checkbutton(
@@ -98,27 +100,31 @@ class BarbaricUI(tk.Tk):
         self.test_ocr_btn = tk.Button(self.toolbar, text="Test OCR", command=self.on_test_ocr, bg="#3b3f46", fg="#ffffff")
         self.test_ocr_btn.pack(side=tk.RIGHT, padx=(6, 0))
 
+        # IO Area
         self.text_area = scrolledtext.ScrolledText(self, wrap=tk.WORD, font=("Consolas", 12), bg="#181a20", fg="#ffffff", height=15)
         self.text_area.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
         self.text_area.config(state=tk.DISABLED)
 
-        self.status = tk.Label(self, text="Say a command or type below.", font=("Arial", 12), fg="#cccccc", bg="#23272e")
+        self.status = tk.Label(self, text="Say a command or type below.", font=("Segoe UI", 12), fg="#cccccc", bg="#23272e")
         self.status.pack(pady=5)
 
         self.input_frame = tk.Frame(self, bg="#23272e")
         self.input_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        self.input_entry = tk.Entry(self.input_frame, font=("Arial", 12), bg="#2c2f36", fg="#ffffff")
+        self.input_entry = tk.Entry(self.input_frame, font=("Segoe UI", 12), bg="#2c2f36", fg="#ffffff")
         self.input_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
         self.input_entry.bind('<Return>', self.on_enter)
 
-        self.send_btn = tk.Button(self.input_frame, text="Send", command=self.on_send, bg="#00ff99", fg="#23272e", font=("Arial", 12, "bold"))
+        self.send_btn = tk.Button(self.input_frame, text="Send", command=self.on_send, bg="#00ff99", fg="#23272e", font=("Segoe UI", 12, "bold"))
         self.send_btn.pack(side=tk.RIGHT)
 
-        self.voice_btn = tk.Button(self, text="Speak", command=self.on_speak, bg="#4da6ff", fg="#23272e", font=("Arial", 12, "bold"))
+        self.voice_btn = tk.Button(self, text="Speak", command=self.on_speak, bg="#4da6ff", fg="#23272e", font=("Segoe UI", 12, "bold"))
         self.voice_btn.pack(pady=5)
 
-    # ===== Visualizer logic =====
+        # Overlay placeholder
+        self._grid_overlay = None
+
+    # ===== Visualizer =====
     def _viz_draw_bars(self):
         c = self.viz_canvas
         c.delete("all")
@@ -128,29 +134,24 @@ class BarbaricUI(tk.Tk):
         gap = 4
         bar_w = max(2, (w - gap * (n + 1)) // n)
         for i, lvl in enumerate(self._viz_levels):
-            # Smooth visual scale
             scale = max(0.02, min(1.0, lvl))
             bh = int(scale * (h - 12))
             x0 = gap + i * (bar_w + gap)
             y0 = h - bh - 6
             x1 = x0 + bar_w
             y1 = h - 6
-            # Neon-like bar with two layers
             c.create_rectangle(x0, y0, x1, y1, fill=self._viz_color, width=0)
             c.create_rectangle(x0, y0, x1, y1, outline="#66ffff", width=1)
-        # Draw a subtle center ring
         cx = w // 2
         cy = h // 2
         r = 22
         c.create_oval(cx - r, cy - r, cx + r, cy + r, outline="#1bd1ff", width=2)
         if self._viz_running:
-            # schedule next draw
-            self.after(33, self._viz_draw_bars)  # ~30 FPS
+            self.after(33, self._viz_draw_bars)
 
     def _viz_step(self):
         if not self._viz_running:
             return
-        # Animate with multi-phase waves and a small jitter
         n = len(self._viz_levels)
         t = time.time()
         base = 0.06 + 0.02 * math.sin(t * 2.1)
@@ -159,14 +160,12 @@ class BarbaricUI(tk.Tk):
             wave = 0.6 + 0.4 * math.sin(t * 4.0 + phase)
             level = min(1.0, base * (1.5 + wave) + 0.02 * random.random())
             self._viz_levels[i] = self._viz_levels[i] * 0.65 + level * 0.35
-        # schedule next frame
         self.after(33, self._viz_step)
 
     def start_visualizer(self):
         if self._viz_running:
             return
         self._viz_running = True
-        # restart draw loop
         self.after(0, self._viz_draw_bars)
         self.after(33, self._viz_step)
         try:
@@ -178,20 +177,18 @@ class BarbaricUI(tk.Tk):
         if not self._viz_running:
             return
         self._viz_running = False
-        # canvas will stop auto-updates on next draw
         try:
             self.status.config(text="Idle.", fg="#cccccc")
         except Exception:
             pass
 
+    # ===== IO =====
     def display_response(self, text):
-        # Thread-safe UI update
         def _append():
             self.text_area.config(state=tk.NORMAL)
             self.text_area.insert(tk.END, f"Barbaric: {text}\n")
             self.text_area.see(tk.END)
             self.text_area.config(state=tk.DISABLED)
-
         self.after(0, _append)
 
     def on_enter(self, event):
@@ -204,13 +201,10 @@ class BarbaricUI(tk.Tk):
             self.text_area.insert(tk.END, f"You: {user_input}\n")
             self.text_area.config(state=tk.DISABLED)
             self.input_entry.delete(0, tk.END)
-            # Directly call the agent's response logic for text input
             response = barbaric.get_ai_response(user_input)
             barbaric.handle_ai_response(response)
 
     def on_speak(self):
-        # Run listen in a short worker to avoid blocking UI
-        # Start visualizer on main thread first
         self.start_visualizer()
         def _listen_and_process():
             try:
@@ -224,7 +218,6 @@ class BarbaricUI(tk.Tk):
                 self.display_response(f"Voice input failed: {e}")
             finally:
                 self.stop_visualizer()
-
         threading.Thread(target=_listen_and_process, daemon=True).start()
 
     def _append_user_voice(self, utterance: str):
@@ -238,7 +231,7 @@ class BarbaricUI(tk.Tk):
             self.destroy()
             sys.exit()
 
-    # Always Listen management
+    # ===== Always Listen =====
     def on_toggle_always_listen(self):
         enabled = bool(self.always_listen_var.get())
         barbaric.SETTINGS["always_listen"] = enabled
@@ -251,7 +244,6 @@ class BarbaricUI(tk.Tk):
         if self.listen_thread and self.listen_thread.is_alive():
             return
         self.listen_stop.clear()
-        # Start visualizer on main thread while Always Listen active
         self.start_visualizer()
 
         def _loop():
@@ -264,25 +256,21 @@ class BarbaricUI(tk.Tk):
                             response = barbaric.get_ai_response(utterance)
                             barbaric.handle_ai_response(response)
                         else:
-                            # Small idle sleep to reduce CPU
                             self.listen_stop.wait(0.2)
                     except Exception as e:
-                        # Schedule UI update from worker thread
                         self.after(0, lambda msg=f"Always Listen error: {e}": self.display_response(msg))
                         self.listen_stop.wait(0.5)
             finally:
                 self.after(0, self.stop_visualizer)
-
         self.listen_thread = threading.Thread(target=_loop, daemon=True)
         self.listen_thread.start()
 
     def stop_always_listen(self):
         self.listen_stop.set()
-        # thread daemon will exit on its own
         self.after(0, self.stop_visualizer)
 
+    # ===== OCR actions =====
     def on_analyze_screen(self):
-        # Run OCR in background and display summary
         def _run():
             try:
                 try:
@@ -311,12 +299,12 @@ class BarbaricUI(tk.Tk):
                 self.display_response(f"OCR test error: {e}")
         threading.Thread(target=_run, daemon=True).start()
 
-    # Settings dialog
+    # ===== Settings =====
     def open_settings(self):
         win = tk.Toplevel(self)
         win.title("Settings")
         win.configure(bg="#23272e")
-        win.geometry("480x400")
+        win.geometry("560x560")
 
         # Voice rate
         tk.Label(win, text="Voice rate", bg="#23272e", fg="#ffffff").pack(pady=(10, 0))
@@ -324,7 +312,7 @@ class BarbaricUI(tk.Tk):
         rate_scale = tk.Scale(win, from_=90, to=200, orient=tk.HORIZONTAL, variable=rate_var, bg="#23272e", fg="#ffffff", highlightthickness=0)
         rate_scale.pack(fill=tk.X, padx=12)
 
-        # Microphone device
+        # Mic device
         tk.Label(win, text="Microphone", bg="#23272e", fg="#ffffff").pack(pady=(10, 0))
         mics = sr.Microphone.list_microphone_names() or ["Default device"]
         mic_names = [str(n) for n in mics]
@@ -361,30 +349,23 @@ class BarbaricUI(tk.Tk):
             path = filedialog.askopenfilename(title="Select tesseract.exe", filetypes=[("Executable","*.exe"), ("All files","*.*")])
             if path:
                 tess_var.set(path)
-
         tk.Button(tess_frame, text="Browse", command=browse_tesseract, bg="#3b3f46", fg="#ffffff").pack(side=tk.RIGHT, padx=(6, 0))
 
         def save_settings():
-            # Apply voice rate
             barbaric.update_voice_settings(rate_var.get())
-            # Apply mic device
             try:
                 idx = mic_names.index(mic_var.get())
             except ValueError:
                 idx = None
             barbaric.SETTINGS["mic_device_index"] = idx
-            # Apply theme
             barbaric.SETTINGS["theme"] = theme_var.get()
             self.apply_theme(theme_var.get())
-            # Apply cursor step
             try:
                 barbaric.SETTINGS["cursor_step"] = int(curstep_var.get())
             except Exception:
                 pass
-            # Apply tesseract path
             path = tess_var.get().strip()
             barbaric.SETTINGS["tesseract_cmd"] = path or None
-            # Quick OCR check
             try:
                 ok, err = barbaric.ocr_is_available()
                 if ok:
@@ -393,15 +374,45 @@ class BarbaricUI(tk.Tk):
                     messagebox.showwarning("Settings", f"OCR not available yet. Details: {err or 'Tesseract not found.'}")
             except Exception:
                 pass
+
+        # Feature toggles
+        tk.Label(win, text="Features", bg="#23272e", fg="#ffffff", font=("Segoe UI", 12, "bold")).pack(pady=(10, 0))
+        feats = barbaric.SETTINGS.setdefault("features", {})
+        feat_vars = {}
+        def add_toggle(key, label):
+            var = tk.BooleanVar(value=bool(feats.get(key, True)))
+            feat_vars[key] = var
+            cb = tk.Checkbutton(win, text=label, variable=var, bg="#23272e", fg="#ffffff", selectcolor="#23272e", activebackground="#23272e")
+            cb.pack(anchor='w', padx=18)
+        add_toggle('ocr', 'Enable OCR and Screen Observe')
+        add_toggle('click_text', 'Enable Click/Hover/Type by Text')
+        add_toggle('cursor_nav', 'Enable Cursor Navigation')
+        add_toggle('grid_nav', 'Enable Grid Navigation and Overlay')
+        add_toggle('skills', 'Enable Skills (experimental)')
+        add_toggle('safety_confirm', 'Safety Confirmation for Dangerous Commands')
+        add_toggle('tts_prefix', 'Prefix TTS with Agent Name')
+        add_toggle('speak_ack', 'Speak Action Acknowledgements')
+
+        # Dev mode
+        dev_var = tk.BooleanVar(value=bool(barbaric.SETTINGS.get('dev_mode', False)))
+        dev_cb = tk.Checkbutton(win, text='Developer Mode (allow update_skill)', variable=dev_var, bg="#23272e", fg="#ff8080", selectcolor="#23272e", activebackground="#23272e")
+        dev_cb.pack(anchor='w', padx=18, pady=(6, 0))
+
+        def on_save_all():
+            save_settings()
+            for k, v in feat_vars.items():
+                feats[k] = bool(v.get())
+            barbaric.SETTINGS['dev_mode'] = bool(dev_var.get())
+            messagebox.showinfo("Settings", "Settings saved.")
             win.destroy()
 
-        tk.Button(win, text="Save", command=save_settings, bg="#00ff99", fg="#23272e").pack(pady=12)
+        tk.Button(win, text="Save", command=on_save_all, bg="#00ff99", fg="#23272e").pack(pady=12)
 
     def apply_theme(self, theme: str):
         if theme == "light":
-            bg = "#f5f5f5"; fg = "#000000"; panel = "#e0e0e0"; accent = "#007acc"
+            bg = "#f5f5f5"; fg = "#000000"; panel = "#e0e0e0"
         else:
-            bg = "#23272e"; fg = "#ffffff"; panel = "#181a20"; accent = "#00ff99"
+            bg = "#23272e"; fg = "#ffffff"; panel = "#181a20"
         self.configure(bg=bg)
         widgets = [
             self.header, self.toolbar, self.status, self.input_frame, self.text_area,
@@ -421,6 +432,49 @@ class BarbaricUI(tk.Tk):
                     w.configure(bg=bg, fg=fg)
             except Exception:
                 pass
+
+    # ===== Overlay grid =====
+    def show_grid_overlay(self):
+        try:
+            if self._grid_overlay and tk.Toplevel.winfo_exists(self._grid_overlay):
+                self._grid_overlay.deiconify()
+                self._grid_overlay.lift()
+                return
+            ov = tk.Toplevel(self)
+            ov.overrideredirect(True)
+            ov.attributes('-topmost', True)
+            try:
+                ov.attributes('-alpha', 0.2)
+            except Exception:
+                pass
+            w = self.winfo_screenwidth()
+            h = self.winfo_screenheight()
+            ov.geometry(f"{w}x{h}+0+0")
+            cv = tk.Canvas(ov, bg='black', highlightthickness=0)
+            cv.pack(fill=tk.BOTH, expand=True)
+            thirds_x = [w//3, 2*w//3]
+            thirds_y = [h//3, 2*h//3]
+            cv.create_line(thirds_x[0], 0, thirds_x[0], h, fill='#00ffff', width=2)
+            cv.create_line(thirds_x[1], 0, thirds_x[1], h, fill='#00ffff', width=2)
+            cv.create_line(0, thirds_y[0], w, thirds_y[0], fill='#00ffff', width=2)
+            cv.create_line(0, thirds_y[1], w, thirds_y[1], fill='#00ffff', width=2)
+            cells = {
+                1: (w//6, 5*h//6), 2: (w//2, 5*h//6), 3: (5*w//6, 5*h//6),
+                4: (w//6, h//2),   5: (w//2, h//2),   6: (5*w//6, h//2),
+                7: (w//6, h//6),   8: (w//2, h//6),   9: (5*w//6, h//6),
+            }
+            for n, (cx, cy) in cells.items():
+                cv.create_text(cx, cy, text=str(n), fill='#00ffff', font=("Segoe UI", 36, "bold"))
+            self._grid_overlay = ov
+        except Exception as e:
+            self.display_response(f"Grid overlay failed: {e}")
+
+    def hide_grid_overlay(self):
+        try:
+            if self._grid_overlay:
+                self._grid_overlay.withdraw()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

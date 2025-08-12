@@ -11,6 +11,11 @@ import queue
 import ctypes
 from ctypes import wintypes
 import pyautogui
+import importlib.util
+import types
+import glob
+from pathlib import Path
+import re
 
 # Initialize text-to-speech engine (prefer Windows SAPI5) and speaking state
 def _init_engine():
@@ -48,8 +53,8 @@ AGENT_NAME = "Barbaric"
 # Runtime settings (tunable from UI)
 SETTINGS = {
     "language": "en-IN",
-    "timeout": 8,
-    "phrase_time_limit": 50,
+    "timeout": 6,
+    "phrase_time_limit": 16,
     "always_listen": False,
     "mic_device_index": None,
     "voice_rate": 135,
@@ -58,6 +63,19 @@ SETTINGS = {
     "tesseract_cmd": r"D:\\Raghav\\EVOLUTION\\Image to text via tesseract\\tesseract.exe",
     # Default cursor navigation step (pixels) for voice cursor_nav
     "cursor_step": 80,
+    # Guard for self-evolution; when true, LLM can update skills files
+    "dev_mode": False,
+    # Runtime feature toggles
+    "features": {
+        "ocr": True,
+        "click_text": True,
+        "cursor_nav": True,
+        "grid_nav": True,
+        "skills": False,  # disabled by default
+        "safety_confirm": True,
+        "tts_prefix": True,
+        "speak_ack": True,
+    },
 }
 
 def update_voice_settings(rate: int | None = None):
@@ -97,14 +115,20 @@ def _tts_worker():
             TTS_IS_PLAYING.set()
             with _tts_lock:
                 try:
-                    engine.say(text)
+                    for chunk in _split_into_tts_chunks(text):
+                        if not chunk:
+                            continue
+                        engine.say(chunk)
                     engine.runAndWait()
                 except Exception as inner:
                     # Reinitialize engine once and retry
                     print(f"pyttsx3 failed, restarting engine: {inner}")
                     try:
                         globals()['engine'] = _init_engine()
-                        engine.say(text)
+                        for chunk in _split_into_tts_chunks(text):
+                            if not chunk:
+                                continue
+                            engine.say(chunk)
                         engine.runAndWait()
                     except Exception as inner2:
                         raise inner2
@@ -130,10 +154,50 @@ _tts_thread.start()
 
 def speak(text):
     # Always prefix with agent name for clarity
-    if AGENT_NAME.lower() not in text.lower():
-        text = f"{AGENT_NAME} says: {text}"
+    if SETTINGS.get("features", {}).get("tts_prefix", True):
+        if AGENT_NAME.lower() not in text.lower():
+            text = f"{AGENT_NAME} says: {text}"
     # Send as a single TTS unit to avoid choppy audio; worker handles splitting
     _tts_queue.put(text)
+
+
+def _split_into_tts_chunks(text: str, max_len: int = 180) -> list[str]:
+    # Prefer sentence boundaries, then fall back to soft wrapping
+    try:
+        sentences = []
+        parts = re.split(r'(?:([.!?]\s)|\n)', text)
+        buf = ''
+        for p in parts:
+            if p is None:
+                continue
+            buf += p
+            if any(ch in p for ch in '.!?\n') and len(buf) >= 1:
+                sentences.append(buf.strip())
+                buf = ''
+        if buf.strip():
+            sentences.append(buf.strip())
+        # Now wrap long sentences softly
+        chunks: list[str] = []
+        for s in sentences:
+            if len(s) <= max_len:
+                chunks.append(s)
+            else:
+                words = s.split()
+                cur = []
+                cur_len = 0
+                for w in words:
+                    if cur_len + len(w) + 1 > max_len and cur:
+                        chunks.append(' '.join(cur))
+                        cur = [w]
+                        cur_len = len(w)
+                    else:
+                        cur.append(w)
+                        cur_len += len(w) + 1
+                if cur:
+                    chunks.append(' '.join(cur))
+        return chunks if chunks else [text]
+    except Exception:
+        return [text]
 
 
 # --- Windows-native MP3 playback via winmm (MCI) ---
@@ -168,7 +232,7 @@ def listen():
 
     with get_microphone() as source:
         print('Listening...')
-        # Use integer seconds to satisfy some type-checkers; 1s is a good default
+        # Quick ambient calibration (int seconds for type-checkers)
         recognizer.adjust_for_ambient_noise(source, duration=1)
         try:
             audio = recognizer.listen(source, timeout=SETTINGS["timeout"], phrase_time_limit=SETTINGS["phrase_time_limit"])
@@ -177,33 +241,60 @@ def listen():
             # Do not speak here to avoid spamming UI; return quietly
             return ''
         try:
-            # Use getattr to appease static checkers; method exists at runtime
-            text = getattr(recognizer, "recognize_google")(audio, language=SETTINGS["language"])  # type: ignore[attr-defined]
-            print(f'You said: {text}')
-            return text.strip()
+            # Try Google with alternatives and choose the longest/best
+            recog = getattr(recognizer, "recognize_google")  # type: ignore[attr-defined]
+            result_all = recog(audio, language=SETTINGS["language"], show_all=True)  # type: ignore[call-arg]
+            candidate = ''
+            if isinstance(result_all, dict) and 'alternative' in result_all:
+                alts = result_all.get('alternative') or []
+                # Prefer transcript with highest confidence/longest length
+                def score(alt):
+                    txt = (alt.get('transcript') or '').strip()
+                    conf = alt.get('confidence', 0.0)
+                    return (conf, len(txt))
+                if alts:
+                    best = max(alts, key=score)
+                    candidate = (best.get('transcript') or '').strip()
+            if not candidate:
+                candidate = recog(audio, language=SETTINGS["language"])  # type: ignore[attr-defined]
+            candidate = (candidate or '').strip()
+            # If result seems too short, attempt a brief follow-up capture to complete it
+            if len(candidate.split()) < 4:
+                try:
+                    audio2 = recognizer.listen(source, timeout=1.2, phrase_time_limit=3)
+                    result2 = recog(audio2, language=SETTINGS["language"])  # type: ignore[attr-defined]
+                    if result2:
+                        candidate = (candidate + ' ' + result2).strip()
+                except Exception:
+                    pass
+            print(f'You said: {candidate}')
+            return candidate
         except sr.UnknownValueError:
             print('Sorry, I did not understand.')
-            speak('Sorry, I did not understand.')
             return ''
 
 def execute_command(command):
     try:
         print(f"[Barbaric] Executing shell command: {command}")
-        speak(f"Executing command: {command}")
+        if SETTINGS.get("features", {}).get("speak_ack", True):
+            speak(f"Executing command: {command}")
         dangerous = ['del ', 'erase ', 'format ', 'shutdown', 'rd ', 'rmdir ', 'reg ', 'diskpart', 'net user', 'net localgroup', 'taskkill', 'powershell Remove-']
-        if any(d in command.lower() for d in dangerous):
-            speak("Warning: This command may be dangerous. Do you want to continue?")
-            confirmation = listen().lower()
-            if 'yes' not in confirmation and 'हाँ' not in confirmation and 'haan' not in confirmation:
-                speak("Command cancelled for your safety.")
-                return
+        if SETTINGS.get("features", {}).get("safety_confirm", True):
+            if any(d in command.lower() for d in dangerous):
+                speak("Warning: This command may be dangerous. Do you want to continue?")
+                confirmation = listen().lower()
+                if 'yes' not in confirmation and 'हाँ' not in confirmation and 'haan' not in confirmation:
+                    speak("Command cancelled for your safety.")
+                    return
         completed = subprocess.run(command, shell=True, capture_output=True, text=True)
         if completed.stdout:
             print(completed.stdout)
-            speak(f"Command output: {completed.stdout[:200]}")
+            if SETTINGS.get("features", {}).get("speak_ack", True):
+                speak(f"Command output: {completed.stdout[:200]}")
         if completed.stderr:
             print(completed.stderr)
-            speak(f"Command error: {completed.stderr[:200]}")
+            if SETTINGS.get("features", {}).get("speak_ack", True):
+                speak(f"Command error: {completed.stderr[:200]}")
     except Exception as e:
         speak('Command execution failed.')
         print('Error:', e)
@@ -300,6 +391,9 @@ def get_ai_response(user_input):
     "To control windows, use: {\"action\": \"window\", \"op\": \"maximize|minimize|close|switch\"}. "
     "To observe the screen, use: {\"action\": \"observe\"}. "
     "To interact by visible text, use: {\"action\": \"click_text\", \"text\": \"label\"}, {\"action\": \"double_click_text\", \"text\": \"label\"}, {\"action\": \"hover_text\", \"text\": \"label\"}, or {\"action\": \"type_at_text\", \"text\": \"label\", \"value\": \"input\"}. "
+    "To show or hide the on-screen navigation grid, use: {\"action\": \"show_grid\"} or {\"action\": \"hide_grid\"}. "
+    "To run a custom skill, use: {\"action\": \"run_skill\", \"name\": \"skill_name\", \"payload\": { ... }}. "
+    "When developer mode is enabled, you may update a skill via: {\"action\": \"update_skill\", \"name\": \"skill_name\", \"code\": \"python module text\"}. Restrict changes to skills only. "
     "When OCR is unavailable, fall back to key/mouse actions or ask the user to install Tesseract. "
         "For chat, use 'action': 'chat' and 'response'. "
         "For each command step, use: {\"action\": \"command\", \"command\": \"<windows shell command>\"}. "
@@ -351,14 +445,16 @@ def handle_ai_response(ai_response):
             if action == 'command':
                 cmd = step.get('command', '')
                 if cmd:
-                    speak(f'Executing: {cmd}')
+                    if SETTINGS.get("features", {}).get("speak_ack", True):
+                        speak(f'Executing: {cmd}')
                     execute_command(cmd)
                 else:
                     speak('No command provided by AI.')
             elif action == 'type':
                 text_to_type = step.get('text', '')
                 if text_to_type:
-                    speak(f'Typing: {text_to_type}')
+                    if SETTINGS.get("features", {}).get("speak_ack", True):
+                        speak(f'Typing: {text_to_type}')
                     type_text(text_to_type)
                 else:
                     speak('No text provided to type.')
@@ -366,19 +462,29 @@ def handle_ai_response(ai_response):
                 mouse_action = step.get('mouse_action', '')
                 mouse_value = step.get('value', None)
                 speed = step.get('speed', None)
-                speak(f'Performing mouse action: {mouse_action}')
+                if SETTINGS.get("features", {}).get("speak_ack", True):
+                    speak(f'Performing mouse action: {mouse_action}')
                 control_mouse(mouse_action, mouse_value, speed)
             elif action == 'cursor_nav':
+                if not SETTINGS.get("features", {}).get("cursor_nav", True):
+                    speak('Cursor navigation is disabled in settings.')
+                    continue
                 direction = step.get('direction', '')
                 amount = step.get('amount', None)
                 cursor_nav(direction, amount)
             elif action == 'grid_nav':
+                if not SETTINGS.get("features", {}).get("grid_nav", True):
+                    speak('Grid navigation is disabled in settings.')
+                    continue
                 cell = step.get('cell', None)
                 grid_nav(cell)
             elif action == 'window':
                 op = step.get('op', '')
                 control_window(op)
             elif action == 'observe':
+                if not SETTINGS.get("features", {}).get("ocr", True):
+                    speak('OCR features are disabled in settings.')
+                    continue
                 txt = screen_ocr()
                 summary = (txt[:600] + '…') if txt and len(txt) > 600 else (txt or '')
                 if summary:
@@ -387,24 +493,36 @@ def handle_ai_response(ai_response):
                 else:
                     speak('I could not read any text from the screen.')
             elif action == 'click_text':
+                if not (SETTINGS.get("features", {}).get("ocr", True) and SETTINGS.get("features", {}).get("click_text", True)):
+                    speak('Click by text is disabled in settings.')
+                    continue
                 label = step.get('text', '')
                 if label:
                     ok = click_by_text(label)
                     if not ok:
                         speak('I could not find that text on screen.')
             elif action == 'double_click_text':
+                if not (SETTINGS.get("features", {}).get("ocr", True) and SETTINGS.get("features", {}).get("click_text", True)):
+                    speak('Click by text is disabled in settings.')
+                    continue
                 label = step.get('text', '')
                 if label:
                     ok = click_by_text(label, clicks=2)
                     if not ok:
                         speak('I could not find that text on screen.')
             elif action == 'hover_text':
+                if not (SETTINGS.get("features", {}).get("ocr", True) and SETTINGS.get("features", {}).get("click_text", True)):
+                    speak('Hover by text is disabled in settings.')
+                    continue
                 label = step.get('text', '')
                 if label:
                     ok = click_by_text(label, clicks=0, move_only=True)
                     if not ok:
                         speak('I could not locate that text to hover.')
             elif action == 'type_at_text':
+                if not (SETTINGS.get("features", {}).get("ocr", True) and SETTINGS.get("features", {}).get("click_text", True)):
+                    speak('Type at text is disabled in settings.')
+                    continue
                 label = step.get('text', '')
                 value = step.get('value', '')
                 if label and value:
@@ -413,6 +531,46 @@ def handle_ai_response(ai_response):
                         type_text(value)
                     else:
                         speak('I could not find the target field by text.')
+            elif action == 'run_skill':
+                if not SETTINGS.get("features", {}).get("skills", False):
+                    speak('Skills are disabled in settings.')
+                    continue
+                name = step.get('name', '')
+                payload = step.get('payload', {})
+                res = run_skill(name, payload)
+                if res is not None:
+                    out = str(res)
+                    print('Skill result:', out)
+                    speak(out[:200])
+            elif action == 'update_skill':
+                if not SETTINGS.get("features", {}).get("skills", False):
+                    speak('Skills are disabled in settings.')
+                elif not SETTINGS.get('dev_mode'):
+                    speak('Developer mode is off; code updates are blocked.')
+                else:
+                    name = step.get('name', '')
+                    code = step.get('code', '')
+                    ok, msg = update_skill(name, code)
+                    speak(msg)
+            elif action == 'show_grid':
+                if not SETTINGS.get("features", {}).get("grid_nav", True):
+                    speak('Grid navigation is disabled in settings.')
+                    continue
+                _ui = get_ui()
+                fn = getattr(_ui, 'show_grid_overlay', None) if _ui else None
+                if callable(fn):
+                    fn()
+                else:
+                    speak('Grid overlay not available.')
+            elif action == 'hide_grid':
+                if not SETTINGS.get("features", {}).get("grid_nav", True):
+                    continue
+                _ui = get_ui()
+                fn = getattr(_ui, 'hide_grid_overlay', None) if _ui else None
+                if callable(fn):
+                    fn()
+                else:
+                    speak('Grid overlay not available.')
             elif action == 'key':
                 keys = step.get('keys', '')
                 press_keys(keys)
@@ -615,3 +773,97 @@ def grid_nav(cell):
         pyautogui.moveTo(x, y, duration=0.12)
     except Exception as e:
         print('grid_nav error:', e)
+
+
+# ===== Self-evolving skills system =====
+_SKILLS: dict[str, types.ModuleType] = {}
+_UI_REF: object | None = None
+
+
+def register_ui(ui_obj: object):
+    """Called by UI to allow main to control overlays, etc."""
+    global _UI_REF
+    _UI_REF = ui_obj
+
+
+def get_ui() -> object | None:
+    return _UI_REF
+
+
+def skills_dir() -> Path:
+    base = Path(__file__).resolve().parent
+    return base / 'skills'
+
+
+def load_skills() -> None:
+    global _SKILLS
+    _SKILLS = {}
+    sdir = skills_dir()
+    if not sdir.exists():
+        return
+    for path in sdir.glob('*.py'):
+        name = path.stem
+        mod = _import_module_from_path(f'voice_agent.skills.{name}', path)
+        if mod is not None:
+            _SKILLS[name] = mod
+
+
+def reload_skills() -> None:
+    load_skills()
+
+
+def run_skill(name: str, payload: dict | None = None):
+    try:
+        if not name:
+            return 'No skill name provided.'
+        if not _SKILLS:
+            load_skills()
+        mod = _SKILLS.get(name)
+        if not mod:
+            return f'Skill {name} not found.'
+        fn = getattr(mod, 'run', None)
+        if not callable(fn):
+            return f'Skill {name} has no run()'
+        ctx = {
+            'os': platform.system(),
+            'python': platform.python_version(),
+        }
+        return fn(payload or {}, ctx)
+    except Exception as e:
+        return f'Skill error: {e}'
+
+
+def update_skill(name: str, code: str) -> tuple[bool, str]:
+    try:
+        if not name or not code:
+            return False, 'Missing skill name or code.'
+        # Restrict to safe filename
+        safe = ''.join(ch for ch in name if ch.isalnum() or ch in ('_', '-')).strip('_-')
+        if not safe:
+            return False, 'Invalid skill name.'
+        sdir = skills_dir()
+        sdir.mkdir(parents=True, exist_ok=True)
+        fpath = sdir / f'{safe}.py'
+        with open(fpath, 'w', encoding='utf-8') as f:
+            f.write(code)
+        # Load/Reload module
+        mod = _import_module_from_path(f'voice_agent.skills.{safe}', fpath)
+        if mod is None:
+            return False, 'Failed to load updated skill.'
+        _SKILLS[safe] = mod
+        return True, f'Skill {safe} updated.'
+    except Exception as e:
+        return False, f'Update failed: {e}'
+
+
+def _import_module_from_path(fullname: str, path: Path) -> types.ModuleType | None:
+    try:
+        spec = importlib.util.spec_from_file_location(fullname, str(path))
+        if spec and spec.loader:
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+            return mod
+        return None
+    except Exception as e:
+        print('Import skill failed:', e)
+        return None
